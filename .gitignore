@@ -1,3 +1,11 @@
 book
 参考资料
 .DS_Store
+# Local Shimo export automation state and outputs
+.shimo-browser-profile/
+shimo-word-export/
+exported-shimo-diaries/
+shimo-diary-urls.txt
+
+__pycache__/
+*.py[cod]
