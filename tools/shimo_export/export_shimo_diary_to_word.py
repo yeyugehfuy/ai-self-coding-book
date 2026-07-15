@@ -34,6 +34,10 @@ class MissingPlaywrightError(RuntimeError):
     pass
 
 
+class SafeExit(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ShimoItem:
     title: str
@@ -100,6 +104,12 @@ MODIFIED_TIME_PATTERN = re.compile(
 SUPPORTED_SUFFIXES: dict[ExportFormat, tuple[str, ...]] = {
     "docx": (".doc", ".docx"),
     "pdf": (".pdf",),
+}
+CONFIG_DEFAULTS = {
+    "default_output_dir": "exported-shimo-diaries",
+    "default_format": "docx",
+    "default_sync": True,
+    "default_time_range": "all",
 }
 
 
@@ -208,6 +218,17 @@ def parse_args() -> argparse.Namespace:
         "--modified-after",
         help="Export documents modified after this date/datetime according to Shimo metadata.",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Open an interactive menu for common backup modes.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.json"),
+        help="Path to config JSON. Defaults to ./config.json.",
+    )
     return parser.parse_args()
 
 
@@ -267,6 +288,144 @@ def dedupe_items(items: Iterable[ShimoItem]) -> list[ShimoItem]:
     return deduped
 
 
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return dict(CONFIG_DEFAULTS)
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    config = dict(CONFIG_DEFAULTS)
+    config.update({key: value for key, value in loaded.items() if value is not None})
+    return config
+
+
+def save_config(path: Path, args: argparse.Namespace) -> None:
+    payload = {
+        "default_output_dir": str(args.output_dir),
+        "default_format": args.format,
+        "default_sync": bool(args.sync),
+        "default_time_range": describe_time_range(args),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def argv_has_option(argv: list[str], option: str) -> bool:
+    return option in argv or any(arg.startswith(f"{option}=") for arg in argv)
+
+
+def apply_config_defaults(args: argparse.Namespace, argv: list[str]) -> None:
+    config = load_config(args.config)
+    if not argv_has_option(argv, "--output-dir"):
+        args.output_dir = Path(
+            config.get("default_output_dir") or CONFIG_DEFAULTS["default_output_dir"]
+        )
+    if not argv_has_option(argv, "--format"):
+        args.format = str(
+            config.get("default_format") or CONFIG_DEFAULTS["default_format"]
+        )
+    if not argv_has_option(argv, "--sync"):
+        args.sync = bool(config.get("default_sync", CONFIG_DEFAULTS["default_sync"]))
+    if not has_modified_time_filter(args):
+        apply_time_range_config(args, str(config.get("default_time_range") or "all"))
+
+
+def clear_time_filters(args: argparse.Namespace) -> None:
+    args.today = False
+    args.days = None
+    args.month = None
+    args.date_from = None
+    args.date_to = None
+    args.modified_after = None
+
+
+def apply_time_range_config(args: argparse.Namespace, value: str) -> None:
+    clear_time_filters(args)
+    if value == "today":
+        args.today = True
+    elif value.startswith("days:"):
+        args.days = int(value.split(":", 1)[1])
+    elif value.startswith("month:"):
+        args.month = value.split(":", 1)[1]
+    elif value.startswith("range:"):
+        _, start, end = value.split(":", 2)
+        args.date_from = start or None
+        args.date_to = end or None
+    elif value.startswith("modified-after:"):
+        args.modified_after = value.split(":", 1)[1]
+
+
+def describe_time_range(args: argparse.Namespace) -> str:
+    if args.today:
+        return "today"
+    if args.days is not None:
+        return f"days:{args.days}"
+    if args.month:
+        return f"month:{args.month}"
+    if args.date_from or args.date_to:
+        return f"range:{args.date_from or ''}:{args.date_to or ''}"
+    if args.modified_after:
+        return f"modified-after:{args.modified_after}"
+    return "all"
+
+
+def safe_input(prompt: str) -> str:
+    value = input(prompt)
+    if "\x18" in value:
+        raise SafeExit("收到 Ctrl+X，已安全退出。")
+    return value.strip()
+
+
+def ensure_interactive_source(args: argparse.Namespace) -> None:
+    if args.folder or args.url or args.urls_file:
+        return
+    folder = safe_input("请输入石墨文件夹链接（Ctrl+X 退出）：")
+    if not folder:
+        raise SafeExit("未提供石墨文件夹链接，已退出。")
+    args.folder = [folder]
+
+
+def run_interactive_menu(args: argparse.Namespace) -> bool:
+    print("石墨日记备份菜单（输入 Ctrl+X 可安全退出）")
+    print("1. 同步全部")
+    print("2. 今天")
+    print("3. 最近7天")
+    print("4. 最近30天")
+    print("5. 指定月份")
+    print("6. 指定日期范围")
+    print("7. 最近修改")
+    print("8. 全部重新导出")
+    print("9. 退出")
+    choice = safe_input("请选择：")
+    clear_time_filters(args)
+    args.force = False
+    if choice == "1":
+        pass
+    elif choice == "2":
+        args.today = True
+    elif choice == "3":
+        args.days = 7
+    elif choice == "4":
+        args.days = 30
+    elif choice == "5":
+        args.month = safe_input("请输入月份（YYYY-MM）：")
+    elif choice == "6":
+        args.date_from = safe_input("开始日期（YYYY-MM-DD，可空）：") or None
+        args.date_to = safe_input("结束日期（YYYY-MM-DD，可空）：") or None
+    elif choice == "7":
+        args.modified_after = safe_input(
+            "导出此时间之后修改的文档（如 2026-07-15 09:30）："
+        )
+    elif choice == "8":
+        args.force = True
+    elif choice == "9":
+        raise SafeExit("已退出。")
+    else:
+        raise SafeExit("未知菜单项，已退出。")
+    ensure_interactive_source(args)
+    return True
+
 
 def parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
@@ -279,6 +438,7 @@ def parse_month(value: str) -> tuple[date, date]:
     else:
         next_month = month_start.replace(month=month_start.month + 1)
     return month_start, next_month - timedelta(days=1)
+
 
 def parse_datetime_filter(value: str) -> datetime:
     for date_format in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -406,6 +566,7 @@ def filter_items_by_modified_time(
         f"无法识别最后修改时间：{missing_or_unrecognized}"
     )
     return filtered
+
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -764,6 +925,37 @@ def export_one(
     return target
 
 
+def write_backup_report(
+    report_path: Path,
+    args: argparse.Namespace,
+    total_items: int,
+    new_count: int,
+    modified_count: int,
+    skipped_count: int,
+    failures: list[ExportFailure],
+    backup_db_path: Path,
+) -> None:
+    lines = [
+        "石墨日记备份报告",
+        f"生成时间：{utc_now()}",
+        f"输出目录：{args.output_dir}",
+        f"备份索引：{backup_db_path}",
+        f"默认配置：{getattr(args, 'config', 'config.json')}",
+        f"导出格式：{args.format}",
+        f"时间范围：{describe_time_range(args)}",
+        f"扫描后待处理文档数：{total_items}",
+        f"新增：{new_count}",
+        f"修改：{modified_count}",
+        f"跳过：{skipped_count}",
+        f"失败：{len(failures)}",
+    ]
+    if failures:
+        lines.append("")
+        lines.append("失败列表：")
+        for failure in failures:
+            lines.append(f"- {failure.title or failure.url}: {failure.reason}")
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 def print_summary(
     new_count: int,
     modified_count: int,
@@ -784,6 +976,14 @@ def print_summary(
 
 def main() -> int:
     args = parse_args()
+    apply_config_defaults(args, sys.argv[1:])
+    try:
+        if args.interactive:
+            run_interactive_menu(args)
+    except SafeExit as exc:
+        print(str(exc))
+        save_config(args.config, args)
+        return 0
     if not args.login_only and not (args.folder or args.url or args.urls_file):
         print(
             "No documents found. Use --folder, --url, or --urls-file.",
@@ -792,6 +992,7 @@ def main() -> int:
         return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    save_config(args.config, args)
     backup_db_path = args.backup_db or default_backup_db_path(args.output_dir)
     backup_records = load_backup_db(backup_db_path)
 
@@ -847,6 +1048,7 @@ def main() -> int:
             return 2
 
         formats = requested_formats(args)
+        total_items = len(items)
         total_jobs = len(items) * len(formats)
         print(f"\n发现 {len(items)} 篇日记")
         print(f"导出格式：{', '.join(formats)}")
@@ -858,7 +1060,11 @@ def main() -> int:
         failures: list[ExportFailure] = []
         completed_jobs = 0
         for item in items:
-            status = "modified" if args.force else sync_status(item, backup_records, formats)
+            status = (
+                "modified"
+                if args.force or not args.sync
+                else sync_status(item, backup_records, formats)
+            )
             if status == "skipped" and not args.force:
                 skipped_count += 1
                 completed_jobs += len(formats)
@@ -902,10 +1108,26 @@ def main() -> int:
         context.close()
 
     save_backup_db(backup_db_path, backup_records)
+    report_path = args.output_dir / "backup-report.txt"
+    write_backup_report(
+        report_path,
+        args,
+        total_items,
+        new_count,
+        modified_count,
+        skipped_count,
+        failures,
+        backup_db_path,
+    )
     print(f"备份索引：{backup_db_path}")
+    print(f"备份报告：{report_path}")
     print_summary(new_count, modified_count, skipped_count, failures)
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n收到中断信号。当前已完成文档的同步状态已保存。")
+        raise SystemExit(130)

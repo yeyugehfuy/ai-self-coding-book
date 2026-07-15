@@ -136,6 +136,58 @@ python tools/shimo_export/export_shimo_diary_to_word.py \
 
 以上筛选条件可以和 `--format`、`--force`、`--sync` 一起使用。筛选发生在完整扫描文件夹和子文件夹之后、增量同步判断之前。
 
+## 交互式菜单
+
+如果不想记命令参数，可以使用交互模式：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py --interactive
+```
+
+菜单包含：
+
+```text
+1. 同步全部
+2. 今天
+3. 最近7天
+4. 最近30天
+5. 指定月份
+6. 指定日期范围
+7. 最近修改
+8. 全部重新导出
+9. 退出
+```
+
+如果命令行没有提供 `--folder`、`--url` 或 `--urls-file`，交互模式会提示输入石墨文件夹链接。菜单输入时可以按 `Ctrl+X` 安全退出；脚本会保存当前配置，已完成导出的同步状态也会随着每篇成功导出即时写入 `backup.json`。
+
+## 默认配置 config.json
+
+脚本会读取并维护本地 `config.json`，用于保存长期使用时的默认偏好：
+
+```json
+{
+  "default_output_dir": "exported-shimo-diaries",
+  "default_format": "docx",
+  "default_sync": true,
+  "default_time_range": "all"
+}
+```
+
+可保存的默认值包括：
+
+- 默认输出目录。
+- 默认导出格式。
+- 默认同步模式。
+- 默认时间范围。
+
+如果要使用其他配置文件路径，可以传入：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --config ./my-shimo-config.json \
+  --interactive
+```
+
 ## 保留用法：导出单篇或 URL 列表
 
 导出单篇：
@@ -184,6 +236,16 @@ python tools/shimo_export/export_shimo_diary_to_word.py \
   --backup-db ./backup.json
 ```
 
+## 备份报告 backup-report.txt
+
+每次导出流程结束后，脚本会在输出目录生成：
+
+```text
+exported-shimo-diaries/backup-report.txt
+```
+
+报告会记录生成时间、输出目录、备份索引路径、配置路径、导出格式、时间范围、扫描后待处理文档数，以及新增、修改、跳过、失败数量；如果有失败，也会写入失败列表。
+
 ## 进度与失败处理
 
 导出时会显示实时进度，例如：
@@ -212,6 +274,8 @@ python tools/shimo_export/export_shimo_diary_to_word.py \
 - `--sync`：使用 `backup.json` 做增量同步；当前默认启用。
 - `--backup-db`：指定备份索引 JSON 路径，默认 `<output-dir>/backup.json`。
 - `--force`：忽略同步判断并重新导出。
+- `--interactive`：进入交互式备份菜单。
+- `--config`：指定配置 JSON 路径，默认 `./config.json`。
 - `--today`：只导出石墨最后修改时间为今天的文档。
 - `--days N`：只导出最近 N 天内修改过的文档。
 - `--month YYYY-MM`：只导出指定月份修改过的文档。

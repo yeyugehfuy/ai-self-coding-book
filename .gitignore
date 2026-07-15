@@ -10,3 +10,5 @@ shimo-diary-urls.txt
 __pycache__/
 *.py[cod]
 backup.json
+config.json
+backup-report.txt
