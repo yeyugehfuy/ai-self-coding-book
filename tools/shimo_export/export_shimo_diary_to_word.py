@@ -16,6 +16,7 @@ import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -179,6 +180,34 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Path to backup metadata JSON. Defaults to <output-dir>/backup.json.",
     )
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="Export documents whose Shimo last modified time is today.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        help="Export documents modified in the last N days according to Shimo metadata.",
+    )
+    parser.add_argument(
+        "--month",
+        help="Export documents modified in a month, for example 2026-07.",
+    )
+    parser.add_argument(
+        "--from",
+        dest="date_from",
+        help="Export documents modified on or after this date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--to",
+        dest="date_to",
+        help="Export documents modified on or before this date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--modified-after",
+        help="Export documents modified after this date/datetime according to Shimo metadata.",
+    )
     return parser.parse_args()
 
 
@@ -238,6 +267,145 @@ def dedupe_items(items: Iterable[ShimoItem]) -> list[ShimoItem]:
     return deduped
 
 
+
+def parse_date(value: str) -> date:
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def parse_month(value: str) -> tuple[date, date]:
+    month_start = datetime.strptime(value, "%Y-%m").date().replace(day=1)
+    if month_start.month == 12:
+        next_month = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        next_month = month_start.replace(month=month_start.month + 1)
+    return month_start, next_month - timedelta(days=1)
+
+def parse_datetime_filter(value: str) -> datetime:
+    for date_format in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(value, date_format)
+            if date_format == "%Y-%m-%d":
+                return datetime.combine(parsed.date(), datetime_time.min)
+            return parsed
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported date/datetime: {value}")
+
+
+def parse_shimo_modified_time(value: str, today: date | None = None) -> datetime | None:
+    value = value.strip()
+    if not value:
+        return None
+    reference_now = (
+        datetime.now()
+        if today is None
+        else datetime.combine(today, datetime_time.min)
+    )
+    today = reference_now.date()
+    relative_match = re.search(r"(\d+)\s*(分钟前|小时前|天前)", value)
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        if unit == "分钟前":
+            return reference_now - timedelta(minutes=amount)
+        if unit == "小时前":
+            return reference_now - timedelta(hours=amount)
+        return reference_now - timedelta(days=amount)
+
+    day_offset = 0
+    if value.startswith("今天"):
+        value = value.replace("今天", "", 1).strip() or "00:00"
+    elif value.startswith("昨天"):
+        day_offset = 1
+        value = value.replace("昨天", "", 1).strip() or "00:00"
+
+    time_match = re.search(r"(\d{1,2}):(\d{2})", value)
+    parsed_time = datetime_time(
+        int(time_match.group(1)), int(time_match.group(2))
+    ) if time_match else datetime_time.min
+    if day_offset:
+        return datetime.combine(today - timedelta(days=day_offset), parsed_time)
+
+    normalized = (
+        value.replace("年", "-")
+        .replace("月", "-")
+        .replace("日", "")
+        .replace("/", "-")
+        .replace(".", "-")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for date_format in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%m-%d %H:%M", "%m-%d"):
+        try:
+            parsed = datetime.strptime(normalized, date_format)
+            if date_format.startswith("%m"):
+                parsed = parsed.replace(year=today.year)
+            if "%H" not in date_format:
+                parsed = datetime.combine(parsed.date(), datetime_time.min)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def has_modified_time_filter(args: argparse.Namespace) -> bool:
+    return bool(
+        args.today
+        or args.days
+        or args.month
+        or args.date_from
+        or args.date_to
+        or args.modified_after
+    )
+
+
+def modified_time_matches(
+    modified_at: datetime, args: argparse.Namespace, today: date | None = None
+) -> bool:
+    today = today or date.today()
+    modified_date = modified_at.date()
+    if args.today and modified_date != today:
+        return False
+    if args.days is not None:
+        if args.days <= 0:
+            raise ValueError("--days must be greater than 0")
+        cutoff = today - timedelta(days=args.days - 1)
+        if modified_date < cutoff or modified_date > today:
+            return False
+    if args.month:
+        month_start, month_end = parse_month(args.month)
+        if modified_date < month_start or modified_date > month_end:
+            return False
+    if args.date_from and modified_date < parse_date(args.date_from):
+        return False
+    if args.date_to and modified_date > parse_date(args.date_to):
+        return False
+    if args.modified_after and modified_at <= parse_datetime_filter(
+        args.modified_after
+    ):
+        return False
+    return True
+
+
+def filter_items_by_modified_time(
+    items: list[ShimoItem], args: argparse.Namespace
+) -> list[ShimoItem]:
+    if not has_modified_time_filter(args):
+        return items
+    filtered: list[ShimoItem] = []
+    missing_or_unrecognized = 0
+    for item in items:
+        modified_at = parse_shimo_modified_time(item.last_modified)
+        if modified_at is None:
+            missing_or_unrecognized += 1
+            continue
+        if modified_time_matches(modified_at, args):
+            filtered.append(item)
+    print(
+        "按石墨最后修改时间过滤："
+        f"{len(items)} -> {len(filtered)}，"
+        f"无法识别最后修改时间：{missing_or_unrecognized}"
+    )
+    return filtered
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -313,7 +481,6 @@ def update_backup_record(
     record.last_exported = utc_now()
     record.export_paths[export_format] = str(exported_path)
     records[document_id] = record
-
 
 
 def try_password_login(
@@ -668,7 +835,9 @@ def main() -> int:
                     )
                 )
 
-        items = dedupe_items([*url_items, *folder_items])
+        items = filter_items_by_modified_time(
+            dedupe_items([*url_items, *folder_items]), args
+        )
         if not items:
             print(
                 "No documents found. Use --folder, --url, or --urls-file.",

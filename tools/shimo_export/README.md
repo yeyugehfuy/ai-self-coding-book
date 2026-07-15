@@ -89,6 +89,53 @@ python tools/shimo_export/export_shimo_diary_to_word.py \
   --format both
 ```
 
+## 按石墨最后修改时间导出
+
+这些模式都以“石墨最后修改时间”为准，不按日记标题里的日期判断。这样即使你补写旧日期的日记，只要石墨最后修改时间落在筛选范围内，也会被选中。
+
+导出今天修改过的日记：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --folder "https://shimo.im/folder/xxxxxxxx" \
+  --today
+```
+
+导出最近 30 天修改过的日记：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --folder "https://shimo.im/folder/xxxxxxxx" \
+  --days 30
+```
+
+导出某个月修改过的日记：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --folder "https://shimo.im/folder/xxxxxxxx" \
+  --month 2026-07
+```
+
+导出指定日期范围内修改过的日记：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --folder "https://shimo.im/folder/xxxxxxxx" \
+  --from 2026-07-01 \
+  --to 2026-07-15
+```
+
+导出某个时间之后修改过的日记：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py \
+  --folder "https://shimo.im/folder/xxxxxxxx" \
+  --modified-after "2026-07-15 09:30"
+```
+
+以上筛选条件可以和 `--format`、`--force`、`--sync` 一起使用。筛选发生在完整扫描文件夹和子文件夹之后、增量同步判断之前。
+
 ## 保留用法：导出单篇或 URL 列表
 
 导出单篇：
@@ -165,13 +212,18 @@ python tools/shimo_export/export_shimo_diary_to_word.py \
 - `--sync`：使用 `backup.json` 做增量同步；当前默认启用。
 - `--backup-db`：指定备份索引 JSON 路径，默认 `<output-dir>/backup.json`。
 - `--force`：忽略同步判断并重新导出。
+- `--today`：只导出石墨最后修改时间为今天的文档。
+- `--days N`：只导出最近 N 天内修改过的文档。
+- `--month YYYY-MM`：只导出指定月份修改过的文档。
+- `--from YYYY-MM-DD` / `--to YYYY-MM-DD`：只导出指定日期范围内修改过的文档。
+- `--modified-after`：只导出指定日期或时间之后修改过的文档。
 - `--max-scrolls`：每个文件夹最多滚动次数，默认 `80`，用于兼容无限滚动加载。
 - `--login-only`：只打开浏览器用于登录，不执行导出。
 
 ## 注意事项
 
 - 当前账号必须对目标日记和子文件夹有查看和导出权限。
-- 增量同步依赖石墨文件夹页能读取到最后修改时间；如果页面没有暴露最后修改时间，脚本会保守使用已有 `backup.json` 记录跳过未变化的文档，必要时可用 `--force` 重新导出。
+- 增量同步和按日期筛选都依赖石墨文件夹页能读取到最后修改时间；如果页面没有暴露最后修改时间，日期筛选会跳过无法识别时间的文档，必要时可去掉日期筛选或使用 `--force` 重新导出。
 - 脚本不能绕过团队或公司禁用导出的权限限制。
 - 石墨网页的菜单文案或 DOM 结构可能变化；如果脚本提示找不到导出按钮，请手动打开一篇日记确认导出入口文案，再调整脚本中的 `MENU_TEXTS` 或 `EXPORT_PATTERNS`。
 - 文件夹遍历依赖页面中的链接结构。如果石墨大幅改版，可能需要调整 `DOC_URL_PATTERN` 或 `FOLDER_URL_PATTERN`。
