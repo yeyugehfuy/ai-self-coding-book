@@ -10,11 +10,12 @@ SHIMO_USERNAME and SHIMO_PASSWORD.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -36,6 +37,7 @@ class MissingPlaywrightError(RuntimeError):
 class ShimoItem:
     title: str
     url: str
+    last_modified: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,15 @@ class ExportFailure:
     title: str
     url: str
     reason: str
+
+
+@dataclass
+class BackupRecord:
+    document_id: str
+    title: str
+    last_modified: str
+    last_exported: str
+    export_paths: dict[str, str] = field(default_factory=dict)
 
 
 def load_playwright():
@@ -79,6 +90,12 @@ EXPORT_PATTERNS: dict[ExportFormat, list[re.Pattern[str]]] = {
 }
 MENU_TEXTS = ["更多", "···", "...", "菜单", "文件", "导出", "下载"]
 NEXT_PAGE_TEXTS = ["下一页", "Next", "下页", ">"]
+MODIFIED_TIME_PATTERN = re.compile(
+    r"(\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2})?|"
+    r"\d{1,2}[-/.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2})?|"
+    r"昨天\s*\d{0,2}:?\d{0,2}|今天\s*\d{0,2}:?\d{0,2}|"
+    r"\d+\s*(?:分钟前|小时前|天前))"
+)
 SUPPORTED_SUFFIXES: dict[ExportFormat, tuple[str, ...]] = {
     "docx": (".doc", ".docx"),
     "pdf": (".pdf",),
@@ -151,6 +168,17 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="Maximum scroll attempts per folder for infinite-loading folders.",
     )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        default=True,
+        help="Use backup.json metadata to export only new or changed documents. Enabled by default.",
+    )
+    parser.add_argument(
+        "--backup-db",
+        type=Path,
+        help="Path to backup metadata JSON. Defaults to <output-dir>/backup.json.",
+    )
     return parser.parse_args()
 
 
@@ -177,8 +205,14 @@ def safe_name(name: str) -> str:
     return name or f"shimo-export-{int(time.time())}"
 
 
+def document_id_from_url(url: str) -> str:
+    parsed = urlparse(normalize_url(url))
+    parts = [part for part in parsed.path.split("/") if part]
+    return parts[-1] if parts else normalize_url(url)
+
+
 def item_key(item: ShimoItem) -> str:
-    return normalize_url(item.url)
+    return document_id_from_url(item.url)
 
 
 def load_url_items(args: argparse.Namespace) -> list[ShimoItem]:
@@ -189,7 +223,7 @@ def load_url_items(args: argparse.Namespace) -> list[ShimoItem]:
             for line in args.urls_file.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         )
-    return [ShimoItem(title="", url=normalize_url(url)) for url in urls]
+    return [ShimoItem(title="", url=normalize_url(url), last_modified="") for url in urls]
 
 
 def dedupe_items(items: Iterable[ShimoItem]) -> list[ShimoItem]:
@@ -202,6 +236,84 @@ def dedupe_items(items: Iterable[ShimoItem]) -> list[ShimoItem]:
         seen.add(key)
         deduped.append(item)
     return deduped
+
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def default_backup_db_path(output_dir: Path) -> Path:
+    return output_dir / "backup.json"
+
+
+def load_backup_db(path: Path) -> dict[str, BackupRecord]:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    documents = data.get("documents", data)
+    records: dict[str, BackupRecord] = {}
+    for document_id, raw_record in documents.items():
+        records[document_id] = BackupRecord(
+            document_id=str(raw_record.get("document_id") or document_id),
+            title=str(raw_record.get("title") or ""),
+            last_modified=str(raw_record.get("last_modified") or ""),
+            last_exported=str(raw_record.get("last_exported") or ""),
+            export_paths=dict(raw_record.get("export_paths") or {}),
+        )
+    return records
+
+
+def save_backup_db(path: Path, records: dict[str, BackupRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": utc_now(),
+        "documents": {
+            document_id: asdict(record)
+            for document_id, record in sorted(records.items())
+        },
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def sync_status(
+    item: ShimoItem,
+    records: dict[str, BackupRecord],
+    formats: Iterable[ExportFormat],
+) -> str:
+    record = records.get(item_key(item))
+    if record is None:
+        return "new"
+    if item.last_modified and record.last_modified != item.last_modified:
+        return "modified"
+    if any(export_format not in record.export_paths for export_format in formats):
+        return "modified"
+    return "skipped"
+
+
+def update_backup_record(
+    records: dict[str, BackupRecord],
+    item: ShimoItem,
+    export_format: ExportFormat,
+    exported_path: Path,
+) -> None:
+    document_id = item_key(item)
+    record = records.get(document_id) or BackupRecord(
+        document_id=document_id,
+        title="",
+        last_modified="",
+        last_exported="",
+    )
+    record.title = item.title or record.title or exported_path.stem
+    record.last_modified = item.last_modified or record.last_modified
+    record.last_exported = utc_now()
+    record.export_paths[export_format] = str(exported_path)
+    records[document_id] = record
+
 
 
 def try_password_login(
@@ -308,11 +420,15 @@ def maybe_click_next_page(
 def collect_visible_items(page: Page) -> tuple[list[ShimoItem], list[ShimoItem]]:
     anchors = page.locator("a[href]").evaluate_all(
         """
-        anchors => anchors.map(anchor => ({
-            href: anchor.href,
-            text: (anchor.innerText || anchor.textContent || anchor.title || '').trim(),
-            title: anchor.title || ''
-        }))
+        anchors => anchors.map(anchor => {
+            const row = anchor.closest('[role="row"], tr, li, .ant-list-item, .file-item') || anchor.parentElement;
+            return {
+                href: anchor.href,
+                text: (anchor.innerText || anchor.textContent || anchor.title || '').trim(),
+                title: anchor.title || '',
+                rowText: row ? (row.innerText || row.textContent || '').trim() : ''
+            };
+        })
         """
     )
     documents: list[ShimoItem] = []
@@ -322,10 +438,12 @@ def collect_visible_items(page: Page) -> tuple[list[ShimoItem], list[ShimoItem]]
         if not url.startswith("https://shimo.im/"):
             continue
         title = safe_name(str(anchor.get("text") or anchor.get("title") or ""))
+        modified_match = MODIFIED_TIME_PATTERN.search(str(anchor.get("rowText") or ""))
+        last_modified = modified_match.group(1).strip() if modified_match else ""
         if is_folder_url(url):
-            folders.append(ShimoItem(title=title, url=url))
+            folders.append(ShimoItem(title=title, url=url, last_modified=last_modified))
         elif is_document_url(url):
-            documents.append(ShimoItem(title=title, url=url))
+            documents.append(ShimoItem(title=title, url=url, last_modified=last_modified))
     return dedupe_items(documents), dedupe_items(folders)
 
 
@@ -479,9 +597,15 @@ def export_one(
     return target
 
 
-def print_summary(success_count: int, skipped_count: int, failures: list[ExportFailure]) -> None:
+def print_summary(
+    new_count: int,
+    modified_count: int,
+    skipped_count: int,
+    failures: list[ExportFailure],
+) -> None:
     print("\n导出完成")
-    print(f"成功：{success_count}")
+    print(f"新增：{new_count}")
+    print(f"修改：{modified_count}")
     print(f"跳过：{skipped_count}")
     print(f"失败：{len(failures)}")
     if failures:
@@ -501,6 +625,8 @@ def main() -> int:
         return 2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    backup_db_path = args.backup_db or default_backup_db_path(args.output_dir)
+    backup_records = load_backup_db(backup_db_path)
 
     url_items = load_url_items(args)
     try:
@@ -557,24 +683,28 @@ def main() -> int:
         print(f"导出格式：{', '.join(formats)}")
         print(f"总任务：{total_jobs}\n")
 
-        success_count = 0
+        new_count = 0
+        modified_count = 0
         skipped_count = 0
         failures: list[ExportFailure] = []
         completed_jobs = 0
         for item in items:
+            status = "modified" if args.force else sync_status(item, backup_records, formats)
+            if status == "skipped" and not args.force:
+                skipped_count += 1
+                completed_jobs += len(formats)
+                print(f"[{completed_jobs}/{total_jobs}]")
+                print(f"跳过未修改：{item.title or item.url}\n")
+                continue
+
+            exported_any_format = False
             for export_format in formats:
                 completed_jobs += 1
                 title = item.title or item.url
                 remaining = total_jobs - completed_jobs
                 print(f"[{completed_jobs}/{total_jobs}]")
                 print(f"正在导出：{title}")
-                print(f"格式：{export_format}，剩余：{remaining}")
-
-                existing_path = expected_output_path(args.output_dir, item, export_format)
-                if existing_path and existing_path.exists() and not args.force:
-                    skipped_count += 1
-                    print(f"✔ 已存在，跳过：{existing_path}\n")
-                    continue
+                print(f"状态：{status}，格式：{export_format}，剩余：{remaining}")
 
                 try:
                     target = export_one(
@@ -585,16 +715,26 @@ def main() -> int:
                         args.timeout_ms,
                         timeout_error,
                     )
-                    success_count += 1
+                    update_backup_record(backup_records, item, export_format, target)
+                    save_backup_db(backup_db_path, backup_records)
+                    exported_any_format = True
                     print(f"✔ 完成：{target}\n")
                 except Exception as exc:
                     failures.append(ExportFailure(title=title, url=item.url, reason=str(exc)))
                     print(f"✘ 失败，已跳过：{exc}\n")
                     continue
 
+            if exported_any_format:
+                if status == "new":
+                    new_count += 1
+                else:
+                    modified_count += 1
+
         context.close()
 
-    print_summary(success_count, skipped_count, failures)
+    save_backup_db(backup_db_path, backup_records)
+    print(f"备份索引：{backup_db_path}")
+    print_summary(new_count, modified_count, skipped_count, failures)
     return 1 if failures else 0
 
 
