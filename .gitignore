@@ -1,3 +1,5 @@
 book
 参考资料
 .DS_Store
+__pycache__/
+*.py[cod]

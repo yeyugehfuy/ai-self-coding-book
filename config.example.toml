@@ -1,0 +1,20 @@
+[backup]
+output_dir = "backups"
+report_dir = "reports"
+incremental = true
+
+[platforms.shimo]
+enabled = true
+
+[platforms.notion]
+enabled = false
+
+[platforms.feishu]
+enabled = false
+
+[formats]
+word = true
+pdf = false
+markdown = true
+html = false
+obsidian = false
