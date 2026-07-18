@@ -9,9 +9,12 @@ writes debug artifacts when the page cannot be detected.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +57,18 @@ class BodyCandidate:
     text: str
 
 
+@dataclass(frozen=True)
+class ExportMetadata:
+    url: str
+    title: str
+    selector: str
+    output_path: str
+    content_hash: str
+    exported_at: str
+    character_count: int
+    skipped: bool = False
+
+
 def debug_log(enabled: bool, message: str) -> None:
     if enabled:
         print(f"[debug] {message}")
@@ -63,6 +78,64 @@ def safe_filename(value: str, fallback: str = "shimo_export") -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", value).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned[:80] or fallback
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_backup_state(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"version": 1, "documents": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_backup_state(path: Path, state: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def update_backup_state(path: Path, metadata: ExportMetadata) -> None:
+    state = load_backup_state(path)
+    documents = state.setdefault("documents", {})
+    if not isinstance(documents, dict):
+        documents = {}
+        state["documents"] = documents
+    documents[metadata.url] = asdict(metadata)
+    state["updated_at"] = metadata.exported_at
+    save_backup_state(path, state)
+
+
+def write_report(path: Path, metadata: ExportMetadata) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    status = "skipped" if metadata.skipped else "exported"
+    lines = [
+        "Personal Knowledge Hub backup report",
+        f"status: {status}",
+        f"time: {metadata.exported_at}",
+        f"url: {metadata.url}",
+        f"title: {metadata.title}",
+        f"selector: {metadata.selector}",
+        f"output: {metadata.output_path}",
+        f"characters: {metadata.character_count}",
+        f"content_hash: {metadata.content_hash}",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def should_skip_export(backup_json: Path, url: str, digest: str, force: bool) -> bool:
+    if force or not backup_json.exists():
+        return False
+    state = load_backup_state(backup_json)
+    documents = state.get("documents", {})
+    if not isinstance(documents, dict):
+        return False
+    previous = documents.get(url, {})
+    return isinstance(previous, dict) and previous.get("content_hash") == digest
 
 
 def save_timeout_debug(page: Page, debug_dir: Path) -> None:
@@ -193,6 +266,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export a Shimo document to Word.")
     parser.add_argument("--url", required=True, help="Shimo document URL")
     parser.add_argument("--output", type=Path, default=None, help="Output .docx path")
+    parser.add_argument("--backup-json", type=Path, default=Path("backup.json"), help="Incremental backup state file")
+    parser.add_argument("--report", type=Path, default=Path("backup-report.txt"), help="Human-readable backup report path")
+    parser.add_argument("--profile-dir", type=Path, default=Path(".shimo-browser-profile"), help="Persistent browser profile for Shimo login state")
+    parser.add_argument("--force", action="store_true", help="Export even when backup.json says content is unchanged")
     parser.add_argument("--debug", action="store_true", help="Print selector, URL, title, and DOM diagnostics")
     parser.add_argument("--debug-dir", type=Path, default=Path("debug"), help="Directory for timeout.png and timeout.html")
     parser.add_argument("--timeout", type=int, default=45000, help="Overall page/body wait timeout in milliseconds")
@@ -211,16 +288,40 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=not args.headed)
-        page = browser.new_page()
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(args.profile_dir),
+            headless=not args.headed,
+        )
+        page = context.new_page()
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=args.timeout)
             candidate = wait_for_body(page, args.debug, args.timeout, args.min_chars)
             title = page.title() or "石墨导出"
+            digest = content_hash(candidate.text)
             output_path = args.output or Path("exports") / f"{safe_filename(title)}.docx"
-            write_word(title, candidate.text, output_path)
-            print(f"[ok] exported selector: {candidate.selector}")
-            print(f"[ok] output: {output_path}")
+
+            skipped = should_skip_export(args.backup_json, args.url, digest, args.force)
+            if skipped:
+                print("[ok] unchanged; export skipped")
+            else:
+                write_word(title, candidate.text, output_path)
+                print(f"[ok] exported selector: {candidate.selector}")
+                print(f"[ok] output: {output_path}")
+
+            metadata = ExportMetadata(
+                url=args.url,
+                title=title,
+                selector=candidate.selector,
+                output_path=str(output_path),
+                content_hash=digest,
+                exported_at=now_iso(),
+                character_count=len(candidate.text),
+                skipped=skipped,
+            )
+            update_backup_state(args.backup_json, metadata)
+            write_report(args.report, metadata)
+            print(f"[ok] backup state: {args.backup_json}")
+            print(f"[ok] report: {args.report}")
             return 0
         except (PlaywrightTimeoutError, ShimoPageTimeoutError) as exc:
             print(f"[timeout] {exc}")
@@ -235,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[debug] DOM found body node: {candidate is not None}")
             return 2
         finally:
-            browser.close()
+            context.close()
 
 
 if __name__ == "__main__":

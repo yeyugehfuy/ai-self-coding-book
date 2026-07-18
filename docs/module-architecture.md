@@ -134,3 +134,22 @@ python tools/shimo_export/export_shimo_diary_to_word.py --url "https://shimo.im/
 debug/timeout.png
 debug/timeout.html
 ```
+
+## 一键同步与自动更新规划
+
+项目根目录规划保留两个面向普通用户的入口：
+
+```text
+同步我的知识库.bat
+更新工具.bat
+```
+
+`同步我的知识库.bat` 最终负责自动登录、检查新增内容、同步石墨、导出 Word、可选导出 PDF、更新 `backup.json`、生成 `backup-report.txt`，并输出本次同步统计。
+
+`更新工具.bat` 负责自动拉取或下载最新程序，同时保留 `.shimo-browser-profile`、`config.toml`、`backup.json`、`backup-report.txt`、`exports/` 等用户数据和登录状态。当前实现优先支持 Git 仓库内 `git fetch` + `git pull --ff-only` 更新；如果用户不是从 Git 克隆的目录运行，会提示手动下载新版并保留用户数据。
+
+后续主流程仍保持统一管线：
+
+```text
+读取配置 -> 登录 -> 同步 -> 增量检查 -> 导出 -> 生成报告 -> 完成
+```

@@ -5,3 +5,7 @@ __pycache__/
 *.py[cod]
 debug/
 exports/
+.shimo-browser-profile/
+config.toml
+backup.json
+backup-report.txt

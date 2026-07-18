@@ -1,10 +1,18 @@
 [backup]
-output_dir = "backups"
-report_dir = "reports"
+output_dir = "exports"
+report_path = "backup-report.txt"
+state_path = "backup.json"
 incremental = true
+
+[update]
+preserve = [".shimo-browser-profile", "config.toml", "backup.json", "backup-report.txt", "exports"]
 
 [platforms.shimo]
 enabled = true
+profile_dir = ".shimo-browser-profile"
+urls = [
+  "https://shimo.im/docs/K0GYR3gFakvm4ZLG/"
+]
 
 [platforms.notion]
 enabled = false

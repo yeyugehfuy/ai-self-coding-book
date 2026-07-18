@@ -17,7 +17,7 @@
 - 导出模块化：批量导出、命名规则、跳过未修改文件、备份报告分别由 `exporters/` 与 `reporting/` 承担。
 - 主流程稳定：`personal_kb_backup/core/` 只负责编排，不绑定任何单一平台或格式。
 
-终极目标是双击 `同步我的知识库.bat` 后自动读取配置、登录、同步、增量导出 Word/PDF，并生成备份报告。当前已提供 `config.example.toml` 配置样例和 `同步我的知识库.bat` 双击入口占位，详细架构见 [第四阶段模块架构](./docs/module-architecture.md)。
+终极目标是普通用户只需要使用根目录的 `同步我的知识库.bat` 和 `更新工具.bat`：前者自动读取配置、登录、同步、增量导出 Word/PDF，并生成备份报告；后者自动更新程序并保留 `.shimo-browser-profile`、`config.toml`、`backup.json` 等用户数据。当前已提供 `config.example.toml` 配置样例、同步入口和更新入口，详细架构见 [第四阶段模块架构](./docs/module-architecture.md)。
 
 ## 作者信息
 
