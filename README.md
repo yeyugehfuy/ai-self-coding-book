@@ -4,6 +4,21 @@
 
 这本书尝试分享如何用自然语言和AI写出真正具有商业价值的复杂应用，而不是那些贪吃蛇玩具。[可以看看这个证据](https://www.bilibili.com/video/BV1BswgeWEkK/?vd_source=fade59d07328dbcb9a0988b7ce98b49d)。
 
+
+## 第四阶段：个人知识库备份工具架构
+
+本仓库现在补充了一个可扩展的个人知识库备份工具骨架，目标不是只做一次性的导出脚本，而是逐步演进为「个人知识资产同步中心」。
+
+核心设计：
+
+- 平台模块化：石墨、Notion、飞书、浏览器网页等输入平台分别放在 `personal_kb_backup/platforms/`。
+- 格式模块化：Word、PDF、Markdown、HTML、Obsidian 等输出格式分别放在 `personal_kb_backup/formats/`。
+- 登录模块化：账号登录、Cookie、Token、浏览器会话统一放在 `personal_kb_backup/auth/` 与 `personal_kb_backup/browser/`。
+- 导出模块化：批量导出、命名规则、跳过未修改文件、备份报告分别由 `exporters/` 与 `reporting/` 承担。
+- 主流程稳定：`personal_kb_backup/core/` 只负责编排，不绑定任何单一平台或格式。
+
+终极目标是普通用户只需要使用根目录的 `同步我的知识库.bat` 和 `更新工具.bat`：前者自动读取配置、登录、同步、增量导出 Word/PDF，并生成备份报告；后者自动更新程序并保留 `.shimo-browser-profile`、`config.toml`、`backup.json` 等用户数据。当前已提供 `config.example.toml` 配置样例、同步入口和更新入口，详细架构见 [第四阶段模块架构](./docs/module-architecture.md)。
+
 ## 作者信息
 
 - 作者

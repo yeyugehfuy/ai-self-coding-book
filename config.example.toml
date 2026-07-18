@@ -1,0 +1,33 @@
+[backup]
+output_dir = "exports"
+report_path = "backup-report.txt"
+state_path = "backup.json"
+incremental = true
+
+[update]
+preserve = [".shimo-browser-profile", "config.toml", "backup.json", "backup-report.txt", "exports"]
+
+[platforms.shimo]
+enabled = true
+profile_dir = ".shimo-browser-profile"
+url_file = "shimo_urls.txt"
+urls = [
+  "https://shimo.im/docs/K0GYR3gFakvm4ZLG/"
+]
+
+[sync]
+default_mode = "new"
+available_modes = ["all", "new", "7days", "30days", "range", "single", "force"]
+
+[platforms.notion]
+enabled = false
+
+[platforms.feishu]
+enabled = false
+
+[formats]
+word = true
+pdf = false
+markdown = true
+html = false
+obsidian = false

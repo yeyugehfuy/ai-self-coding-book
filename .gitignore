@@ -1,3 +1,11 @@
 book
 参考资料
 .DS_Store
+__pycache__/
+*.py[cod]
+debug/
+exports/
+.shimo-browser-profile/
+config.toml
+backup.json
+backup-report.txt
