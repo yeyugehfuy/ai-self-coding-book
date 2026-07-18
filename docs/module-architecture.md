@@ -161,3 +161,13 @@ debug/timeout.html
 同步数据库 `backup.json` 升级为版本 2，按 URL 保存标题、本地文件名、本地路径、下载时间、石墨最后修改时间、可选文件 Hash、导出格式。默认同步模式是 `new`：只有新增文章，或检测到石墨最后修改时间变化的文章，才会重新下载；已下载且未修改的文章会跳过。
 
 `同步我的知识库.bat` 现在先进入菜单，支持第一次同步、同步新增、最近 7 天、最近 30 天、指定日期范围、指定文章、强制重新同步全部。指定日期范围会根据文章标题中的 `26.7.01` / `26.7.15` 这类日期筛选。
+
+### 菜单定位调试
+
+石墨顶部菜单不再依赖 `text=更多`。脚本优先使用 `aria-haspopup`、`aria-expanded`、`aria-label`、`data-testid`、`button:has(svg)`、`[role=button]:has(svg)` 等更稳定的按钮结构；如果仍找不到，会回退到页面右上角可见按钮，并在失败时打印所有可见按钮/菜单项的 `tag`、`role`、`aria-label`、`title`、`text`、`class` 和坐标。
+
+可单独运行按钮诊断：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py --url "https://shimo.im/docs/K0GYR3gFakvm4ZLG/" --debug --dump-buttons --headed
+```

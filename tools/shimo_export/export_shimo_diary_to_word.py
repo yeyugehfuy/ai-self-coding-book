@@ -27,14 +27,22 @@ else:
 
 
 MENU_SELECTORS = [
+    "button[aria-haspopup='menu']",
+    "button[aria-expanded]",
+    "[role='button'][aria-haspopup='menu']",
+    "[role='button'][aria-expanded]",
+    "button[aria-label*='more' i]",
+    "button[aria-label*='menu' i]",
+    "button[aria-label*='operation' i]",
+    "button[aria-label*='操作']",
+    "button[aria-label*='菜单']",
     "button[aria-label*='更多']",
-    "button[aria-label*='More']",
-    "[role='button'][aria-label*='更多']",
-    "[role='button'][aria-label*='More']",
-    "button:has-text('...')",
-    "button:has-text('⋯')",
-    "button:has-text('···')",
-    "text=更多",
+    "[data-testid*='more' i]",
+    "[data-test*='more' i]",
+    "[class*='more' i]",
+    "[class*='menu' i]",
+    "button:has(svg)",
+    "[role='button']:has(svg)",
 ]
 
 DOWNLOAD_SELECTORS = [
@@ -202,19 +210,128 @@ def save_timeout_debug(page: Page, debug_dir: Path) -> None:
     print(f"[timeout] html saved: {html_path}")
 
 
+
+def describe_interactive_elements(page: Page, limit: int = 80) -> list[dict[str, object]]:
+    return page.evaluate(
+        """
+        (limit) => Array.from(document.querySelectorAll('button,[role="button"],[role="menuitem"],a'))
+            .map((node, index) => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                const visible = style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && rect.width > 0
+                    && rect.height > 0;
+                return {
+                    index,
+                    tag: node.tagName.toLowerCase(),
+                    role: node.getAttribute('role') || '',
+                    ariaLabel: node.getAttribute('aria-label') || '',
+                    title: node.getAttribute('title') || '',
+                    text: (node.innerText || node.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80),
+                    className: typeof node.className === 'string' ? node.className.slice(0, 160) : '',
+                    visible,
+                    disabled: Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true',
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                };
+            })
+            .filter((item) => item.visible)
+            .sort((a, b) => (a.y - b.y) || (b.x - a.x))
+            .slice(0, limit)
+        """,
+        limit,
+    )
+
+
+def print_interactive_elements(page: Page, title: str = "interactive elements") -> None:
+    print(f"[debug] {title}:")
+    try:
+        for item in describe_interactive_elements(page):
+            print(
+                "[debug] "
+                f"#{item['index']} tag={item['tag']} role={item['role']!r} "
+                f"aria={item['ariaLabel']!r} title={item['title']!r} "
+                f"text={item['text']!r} class={item['className']!r} "
+                f"box=({item['x']},{item['y']},{item['width']},{item['height']}) "
+                f"disabled={item['disabled']}"
+            )
+    except Exception as exc:
+        print(f"[debug] cannot dump interactive elements: {exc}")
+
+
+def visible_locator_candidates(page: Page, selector: str, timeout_ms: int) -> list[Locator]:
+    page.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
+    locator = page.locator(selector)
+    count = min(locator.count(), 30)
+    candidates: list[Locator] = []
+    for index in range(count):
+        item = locator.nth(index)
+        try:
+            if item.is_visible() and item.bounding_box() is not None:
+                candidates.append(item)
+        except Exception:
+            continue
+    return candidates
+
+
+def top_right_button(page: Page, debug: bool) -> Locator | None:
+    buttons = page.locator("button,[role='button']")
+    best: tuple[float, Locator] | None = None
+    count = min(buttons.count(), 80)
+    viewport = page.viewport_size or {"width": 1280, "height": 720}
+    for index in range(count):
+        item = buttons.nth(index)
+        try:
+            box = item.bounding_box()
+            if not item.is_visible() or box is None:
+                continue
+            # Prefer visible controls in the top-right document toolbar.
+            if box["y"] > 160 or box["x"] < viewport["width"] * 0.45:
+                continue
+            text = (item.inner_text(timeout=200) or "").strip()
+            aria = item.get_attribute("aria-label") or ""
+            score = box["x"] - box["y"]
+            # Avoid obvious user/avatar/share controls when possible.
+            bad_words = ("分享", "share", "头像", "avatar", "comment", "评论")
+            if any(word.lower() in f"{text} {aria}".lower() for word in bad_words):
+                score -= 1000
+            if best is None or score > best[0]:
+                best = (score, item)
+        except Exception:
+            continue
+    if best:
+        debug_log(debug, "using top-right visible button fallback for menu")
+        return best[1]
+    return None
+
 def first_visible(page: Page, selectors: Iterable[str], debug: bool, timeout_ms: int = 2500) -> Locator:
     last_error: Exception | None = None
     for selector in selectors:
         debug_log(debug, f"waiting/click candidate: {selector}")
-        locator = page.locator(selector).first
         try:
-            locator.wait_for(state="visible", timeout=timeout_ms)
-            debug_log(debug, f"found selector: {selector}")
-            return locator
+            candidates = visible_locator_candidates(page, selector, timeout_ms)
+            if candidates:
+                debug_log(debug, f"found selector: {selector}, visible_count={len(candidates)}")
+                return candidates[0]
         except Exception as exc:
             last_error = exc
             debug_log(debug, f"selector unavailable: {selector} ({exc})")
     raise RuntimeError(f"No visible selector found. Last error: {last_error}")
+
+
+def click_menu_button(page: Page, debug: bool) -> None:
+    try:
+        menu = first_visible(page, MENU_SELECTORS, debug, timeout_ms=1200)
+    except Exception as exc:
+        debug_log(debug, f"stable menu selectors failed: {exc}")
+        menu = top_right_button(page, debug)
+        if menu is None:
+            print_interactive_elements(page, "visible buttons before menu failure")
+            raise
+    menu.click()
 
 
 def read_shimo_updated_at(page: Page, debug: bool) -> str | None:
@@ -232,10 +349,15 @@ def read_shimo_updated_at(page: Page, debug: bool) -> str | None:
 
 
 def trigger_official_word_download(page: Page, debug: bool, timeout_ms: int) -> Download:
-    menu = first_visible(page, MENU_SELECTORS, debug)
-    menu.click()
+    if debug:
+        print_interactive_elements(page, "visible buttons before opening menu")
+    click_menu_button(page, debug)
+    if debug:
+        print_interactive_elements(page, "visible buttons/menuitems after opening menu")
     download_item = first_visible(page, DOWNLOAD_SELECTORS, debug)
     download_item.click()
+    if debug:
+        print_interactive_elements(page, "visible buttons/menuitems after clicking download")
     word_item = first_visible(page, WORD_SELECTORS, debug)
     with page.expect_download(timeout=timeout_ms) as download_info:
         word_item.click()
@@ -280,6 +402,14 @@ def export_one(page: Page, args: argparse.Namespace, url: str, stats: SyncStats,
             debug_log(args.debug, "networkidle timeout; continue official download flow")
 
         title = safe_filename(page.title() or "石墨文档")
+        if args.debug:
+            debug_log(args.debug, f"current page title: {title}")
+            debug_log(args.debug, f"current url: {page.url}")
+        if args.dump_buttons:
+            print_interactive_elements(page, "visible buttons/menuitems")
+            stats.skipped += 1
+            report_lines.append(f"调试按钮：{title} {url}")
+            return
         shimo_updated_at = args.updated_at or read_shimo_updated_at(page, args.debug)
         if args.start_date or args.end_date:
             if not in_date_range(title, args.start_date, args.end_date):
@@ -354,6 +484,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--hash-file", action="store_true", help="Hash downloaded .docx file and store it in backup.json")
     parser.add_argument("--force", action="store_true", help="Export even when backup.json says content is unchanged")
     parser.add_argument("--debug", action="store_true", help="Print selector, URL, title, and DOM diagnostics")
+    parser.add_argument("--dump-buttons", action="store_true", help="Print visible buttons/menuitems and exit after page load")
     parser.add_argument("--debug-dir", type=Path, default=Path("debug"), help="Directory for timeout.png and timeout.html")
     parser.add_argument("--timeout", type=int, default=45000, help="Page/download timeout in milliseconds")
     parser.add_argument("--headed", action="store_true", help="Run Chromium with a visible window")
