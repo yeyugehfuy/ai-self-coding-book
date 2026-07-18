@@ -2,8 +2,8 @@
 
 The tool intentionally does not parse Shimo page HTML into Word. It simulates the
 manual browser operation instead: open document, click the top-right menu, choose
-Download/Export, choose Word, wait for the browser download, then rename/move the
-official `.docx` into `exports/YYYY/MM/` and update `backup.json`.
+Download, choose Word, wait for the browser download, then rename/move the
+official `.docx` into `exports/` using Shimo's suggested filename and update `backup.json`.
 """
 
 from __future__ import annotations
@@ -39,19 +39,16 @@ MENU_SELECTORS = [
     "button[aria-label*='更多']",
     "[data-testid*='more' i]",
     "[data-test*='more' i]",
-    "[class*='more' i]",
-    "[class*='menu' i]",
     "button:has(svg)",
     "[role='button']:has(svg)",
 ]
 
 DOWNLOAD_SELECTORS = [
     "text=下载",
-    "text=导出",
-    "text=Download",
-    "text=Export",
+    "[aria-label*='下载']",
     "[role='menuitem']:has-text('下载')",
-    "[role='menuitem']:has-text('导出')",
+    "[role='button']:has-text('下载')",
+    "button:has-text('下载')",
 ]
 
 WORD_SELECTORS = [
@@ -63,7 +60,6 @@ WORD_SELECTORS = [
 ]
 
 TITLE_DATE_RE = re.compile(r"(?P<yy>\d{2})[.年/-](?P<m>\d{1,2})[.月/-](?P<d>\d{1,2})")
-UPDATED_RE = re.compile(r"(?:最后修改|最近更新|更新时间|修改于|更新于)[：:\s]*(?P<value>[^\n]+)")
 
 
 @dataclass(frozen=True)
@@ -334,43 +330,53 @@ def click_menu_button(page: Page, debug: bool) -> None:
     menu.click()
 
 
-def read_shimo_updated_at(page: Page, debug: bool) -> str | None:
-    try:
-        body_text = page.locator("body").inner_text(timeout=3000)
-    except Exception as exc:
-        debug_log(debug, f"cannot read body text for updated_at: {exc}")
-        return None
-    match = UPDATED_RE.search(body_text)
-    if match:
-        value = match.group("value").strip()[:80]
-        debug_log(debug, f"detected shimo_updated_at: {value}")
-        return value
-    return None
-
-
 def trigger_official_word_download(page: Page, debug: bool, timeout_ms: int) -> Download:
     if debug:
         print_interactive_elements(page, "visible buttons before opening menu")
     click_menu_button(page, debug)
+    debug_log(debug, "clicked menu button")
     if debug:
         print_interactive_elements(page, "visible buttons/menuitems after opening menu")
     download_item = first_visible(page, DOWNLOAD_SELECTORS, debug)
-    download_item.click()
+    debug_log(debug, "found download menu")
+    download_item.hover()
+    debug_log(debug, "hovered download menu")
     if debug:
-        print_interactive_elements(page, "visible buttons/menuitems after clicking download")
+        print_interactive_elements(page, "visible buttons/menuitems after hovering download")
     word_item = first_visible(page, WORD_SELECTORS, debug)
+    debug_log(debug, "found Word menu item")
     with page.expect_download(timeout=timeout_ms) as download_info:
         word_item.click()
-    return download_info.value
+    download = download_info.value
+    debug_log(debug, f"download suggested filename: {download.suggested_filename}")
+    return download
 
 
-def move_download(download: Download, output_path: Path) -> Path:
+def downloaded_filename(download: Download) -> str:
+    suggested = download.suggested_filename or "shimo.docx"
+    if not suggested.lower().endswith(".docx"):
+        suggested = f"{suggested}.docx"
+    return safe_filename(suggested)
+
+
+def save_download_to_temp(download: Download, temp_dir: Path) -> Path:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / downloaded_filename(download)
+    download.save_as(str(temp_path))
+    return temp_path
+
+
+def keep_or_skip_download(temp_path: Path, output_path: Path, backup_json: Path, url: str) -> tuple[Path, str, bool]:
+    digest = file_hash(temp_path)
+    previous = previous_metadata(backup_json, url)
+    if previous and previous.get("content_hash") == digest and output_path.exists():
+        temp_path.unlink(missing_ok=True)
+        return output_path, digest, True
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    suggested = safe_filename(download.suggested_filename or output_path.name)
-    if output_path.name == "":
-        output_path = output_path / suggested
-    download.save_as(str(output_path))
-    return output_path
+    if output_path.exists():
+        output_path.unlink()
+    temp_path.replace(output_path)
+    return output_path, digest, False
 
 
 def write_report(path: Path, stats: SyncStats, export_dir: Path, last_sync: str, lines: list[str]) -> None:
@@ -410,7 +416,7 @@ def export_one(page: Page, args: argparse.Namespace, url: str, stats: SyncStats,
             stats.skipped += 1
             report_lines.append(f"调试按钮：{title} {url}")
             return
-        shimo_updated_at = args.updated_at or read_shimo_updated_at(page, args.debug)
+        shimo_updated_at = args.updated_at
         if args.start_date or args.end_date:
             if not in_date_range(title, args.start_date, args.end_date):
                 stats.skipped += 1
@@ -418,16 +424,10 @@ def export_one(page: Page, args: argparse.Namespace, url: str, stats: SyncStats,
                 return
 
         existed_before = previous_metadata(args.backup_json, url) is not None
-        if should_skip_export(args.backup_json, url, shimo_updated_at, args.force):
-            stats.skipped += 1
-            report_lines.append(f"跳过（未修改）：{title} {url}")
-            print(f"[skip] unchanged: {title}")
-            return
-
-        output_path = args.output or default_output_path(args.output_dir, title)
         download = trigger_official_word_download(page, args.debug, args.timeout)
-        final_path = move_download(download, output_path)
-        digest = file_hash(final_path) if args.hash_file else None
+        output_path = args.output or (args.output_dir / downloaded_filename(download))
+        temp_path = save_download_to_temp(download, args.output_dir / ".tmp")
+        final_path, digest, unchanged = keep_or_skip_download(temp_path, output_path, args.backup_json, url)
         metadata = ExportMetadata(
             title=title,
             url=url,
@@ -438,13 +438,20 @@ def export_one(page: Page, args: argparse.Namespace, url: str, stats: SyncStats,
             content_hash=digest,
         )
         update_backup_state(args.backup_json, metadata)
-        if existed_before:
+        if unchanged:
+            stats.skipped += 1
+            report_lines.append(f"跳过（Hash 未变化）：{title} -> {final_path}")
+            print(f"[skip] downloaded Word hash unchanged: {final_path}")
+        elif existed_before:
             stats.updated += 1
             report_lines.append(f"更新：{title} -> {final_path}")
+            print(f"[ok] official Word updated: {final_path}")
         else:
             stats.added += 1
             report_lines.append(f"新增：{title} -> {final_path}")
-        print(f"[ok] official Word downloaded: {final_path}")
+            print(f"[ok] official Word downloaded: {final_path}")
+        debug_log(args.debug, f"download path: {final_path}")
+        debug_log(args.debug, f"download success: {final_path.exists()}")
     except Exception as exc:
         stats.failed += 1
         report_lines.append(f"失败：{url} {exc}")
@@ -473,7 +480,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--urls", nargs="*", help="One or more Shimo document URLs")
     parser.add_argument("--url-file", type=Path, help="Text file containing one Shimo URL per line")
     parser.add_argument("--output", type=Path, default=None, help="Single-document output .docx path")
-    parser.add_argument("--output-dir", type=Path, default=Path("exports"), help="Base export directory")
+    parser.add_argument("--output-dir", type=Path, default=Path("exports"), help="Base export directory; official Shimo filenames are kept here")
     parser.add_argument("--backup-json", type=Path, default=Path("backup.json"), help="Sync database path")
     parser.add_argument("--report", type=Path, default=Path("backup-report.txt"), help="Human-readable sync report path")
     parser.add_argument("--profile-dir", type=Path, default=Path(".shimo-browser-profile"), help="Persistent browser profile for Shimo login state")
@@ -481,7 +488,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--start", help="Start date for range mode, e.g. 26.7.01 or 2026-07-01")
     parser.add_argument("--end", help="End date for range mode, e.g. 26.7.15 or 2026-07-15")
     parser.add_argument("--updated-at", help="Known Shimo last modified time for a single document")
-    parser.add_argument("--hash-file", action="store_true", help="Hash downloaded .docx file and store it in backup.json")
     parser.add_argument("--force", action="store_true", help="Export even when backup.json says content is unchanged")
     parser.add_argument("--debug", action="store_true", help="Print selector, URL, title, and DOM diagnostics")
     parser.add_argument("--dump-buttons", action="store_true", help="Print visible buttons/menuitems and exit after page load")

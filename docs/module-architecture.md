@@ -156,9 +156,9 @@ debug/timeout.html
 
 ## 官方 Word 下载策略
 
-石墨导出不再解析网页源码，也不再尝试自己拼 Word。新的最高优先级策略是模拟人工操作：打开文章，等待页面可操作，点击右上角更多菜单，点击下载/导出，选择 Word，等待浏览器下载完成，然后按文章标题重命名并移动到 `exports/YYYY/MM/`。
+石墨导出不再解析网页源码，也不再尝试自己拼 Word。新的最高优先级策略是模拟人工操作：打开文章，等待页面可操作，点击右上角更多菜单，点击下载，选择 Word，等待浏览器下载完成，然后使用石墨官方建议文件名保存到 `exports/`。
 
-同步数据库 `backup.json` 升级为版本 2，按 URL 保存标题、本地文件名、本地路径、下载时间、石墨最后修改时间、可选文件 Hash、导出格式。默认同步模式是 `new`：只有新增文章，或检测到石墨最后修改时间变化的文章，才会重新下载；已下载且未修改的文章会跳过。
+同步数据库 `backup.json` 升级为版本 2，按 URL 保存标题、本地文件名、本地路径、下载时间、石墨最后修改时间、文件 Hash、导出格式。当前以官方下载后的 `.docx` Hash 判断是否变化；Hash 未变化会删除临时文件并跳过覆盖。
 
 `同步我的知识库.bat` 现在先进入菜单，支持第一次同步、同步新增、最近 7 天、最近 30 天、指定日期范围、指定文章、强制重新同步全部。指定日期范围会根据文章标题中的 `26.7.01` / `26.7.15` 这类日期筛选。
 
@@ -171,3 +171,10 @@ debug/timeout.html
 ```bash
 python tools/shimo_export/export_shimo_diary_to_word.py --url "https://shimo.im/docs/K0GYR3gFakvm4ZLG/" --debug --dump-buttons --headed
 ```
+
+
+## 最终石墨 Word 下载约束
+
+当前石墨实现只做官方 Word 下载：打开文章，点击右上角 `...`，hover `下载`，点击子菜单 `Word`，使用 Playwright Download API 等待浏览器下载，然后用 `download.save_as()` 先保存临时文件，计算文件 Hash；如果 Hash 与 `backup.json` 中记录一致则删除临时文件并跳过，否则保存到 `exports/`，文件名保持石墨建议下载名。
+
+菜单查找不再保留“导出”兼容路径；下载菜单按 `text=下载`、`aria-label`、`role`、普通 locator、右上角 bounding box 兜底的顺序处理。
