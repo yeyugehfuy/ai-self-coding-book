@@ -117,3 +117,20 @@ personal_kb_backup/
 ## GitHub 账号切换建议
 
 如果需要换另一个 GitHub 账号继续维护，推荐用 GitHub Desktop 完成登录切换，然后重新克隆或重新绑定当前仓库远程地址。代码结构模块化后，后续升级通常只需要改某个平台或格式模块，再通过 GitHub Desktop 提交和同步即可。
+
+## 石墨正文等待与调试策略
+
+`tools/shimo_export/export_shimo_diary_to_word.py` 不再依赖旧版石墨页面的固定按钮或工具栏。脚本会先检查正文候选节点是否已经可见；如果正文已出现，就立即导出。否则再等待 `networkidle`，并继续轮询新版正文容器候选 selector。
+
+调试时可追加：
+
+```bash
+python tools/shimo_export/export_shimo_diary_to_word.py --url "https://shimo.im/docs/K0GYR3gFakvm4ZLG/" --debug
+```
+
+如果仍然超时，脚本会打印当前 URL、页面标题，并保存：
+
+```text
+debug/timeout.png
+debug/timeout.html
+```
