@@ -1,9 +1,9 @@
-"""Export a readable Shimo document page to a Word file.
+"""Export Shimo documents through Shimo's official Word download flow.
 
-This script intentionally avoids waiting for legacy Shimo toolbar buttons. Newer
-Shimo pages can render readable article content while old fixed controls never
-appear, so the export flow now waits for document body candidates first and
-writes debug artifacts when the page cannot be detected.
+The tool intentionally does not parse Shimo page HTML into Word. It simulates the
+manual browser operation instead: open document, click the top-right menu, choose
+Download/Export, choose Word, wait for the browser download, then rename/move the
+official `.docx` into `exports/YYYY/MM/` and update `backup.json`.
 """
 
 from __future__ import annotations
@@ -14,59 +14,69 @@ import json
 import re
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
-    from playwright.sync_api import Page
+    from playwright.sync_api import Download, Locator, Page
 else:
+    Download = Any
+    Locator = Any
     Page = Any
 
-try:
-    from docx import Document
-except ImportError:  # pragma: no cover - handled at runtime for friendly CLI output
-    Document = None  # type: ignore[assignment]
 
-
-class ShimoPageTimeoutError(RuntimeError):
-    """Raised when a readable Shimo body cannot be found."""
-
-
-BODY_SELECTORS = [
-    "[data-testid*='editor']",
-    "[data-test*='editor']",
-    "[class*='editor']",
-    "[class*='Editor']",
-    "[class*='reader']",
-    "[class*='Reader']",
-    "[class*='article']",
-    "[class*='Article']",
-    "[class*='document']",
-    "[class*='Document']",
-    "[contenteditable='true']",
-    "main",
-    "article",
-    "body",
+MENU_SELECTORS = [
+    "button[aria-label*='更多']",
+    "button[aria-label*='More']",
+    "[role='button'][aria-label*='更多']",
+    "[role='button'][aria-label*='More']",
+    "button:has-text('...')",
+    "button:has-text('⋯')",
+    "button:has-text('···')",
+    "text=更多",
 ]
 
+DOWNLOAD_SELECTORS = [
+    "text=下载",
+    "text=导出",
+    "text=Download",
+    "text=Export",
+    "[role='menuitem']:has-text('下载')",
+    "[role='menuitem']:has-text('导出')",
+]
 
-@dataclass(frozen=True)
-class BodyCandidate:
-    selector: str
-    text: str
+WORD_SELECTORS = [
+    "text=Word",
+    "text=.docx",
+    "text=DOCX",
+    "[role='menuitem']:has-text('Word')",
+    "[role='menuitem']:has-text('docx')",
+]
+
+TITLE_DATE_RE = re.compile(r"(?P<yy>\d{2})[.年/-](?P<m>\d{1,2})[.月/-](?P<d>\d{1,2})")
+UPDATED_RE = re.compile(r"(?:最后修改|最近更新|更新时间|修改于|更新于)[：:\s]*(?P<value>[^\n]+)")
 
 
 @dataclass(frozen=True)
 class ExportMetadata:
-    url: str
     title: str
-    selector: str
-    output_path: str
-    content_hash: str
-    exported_at: str
-    character_count: int
+    url: str
+    local_filename: str
+    local_path: str
+    downloaded_at: str
+    shimo_updated_at: str | None
+    content_hash: str | None
+    export_format: str = "word"
     skipped: bool = False
+
+
+@dataclass
+class SyncStats:
+    added: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
 
 
 def debug_log(enabled: bool, message: str) -> None:
@@ -74,23 +84,46 @@ def debug_log(enabled: bool, message: str) -> None:
         print(f"[debug] {message}")
 
 
-def safe_filename(value: str, fallback: str = "shimo_export") -> str:
-    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", value).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:80] or fallback
-
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def safe_filename(value: str, fallback: str = "shimo_export") -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", value).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned[:120] or fallback
+
+
+def title_date(title: str) -> date | None:
+    match = TITLE_DATE_RE.search(title)
+    if not match:
+        return None
+    year = 2000 + int(match.group("yy"))
+    return date(year, int(match.group("m")), int(match.group("d")))
+
+
+def dated_output_dir(base_dir: Path, title: str) -> Path:
+    parsed = title_date(title)
+    if parsed is None:
+        parsed = datetime.now().date()
+    return base_dir / f"{parsed.year:04d}" / f"{parsed.month:02d}"
+
+
+def default_output_path(base_dir: Path, title: str) -> Path:
+    return dated_output_dir(base_dir, title) / f"{safe_filename(title)}.docx"
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_backup_state(path: Path) -> dict[str, object]:
     if not path.exists():
-        return {"version": 1, "documents": {}}
+        return {"version": 2, "documents": {}, "last_sync_at": None}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -99,43 +132,59 @@ def save_backup_state(path: Path, state: dict[str, object]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def update_backup_state(path: Path, metadata: ExportMetadata) -> None:
-    state = load_backup_state(path)
+def backup_documents(state: dict[str, object]) -> dict[str, object]:
     documents = state.setdefault("documents", {})
     if not isinstance(documents, dict):
         documents = {}
         state["documents"] = documents
-    documents[metadata.url] = asdict(metadata)
-    state["updated_at"] = metadata.exported_at
+    return documents
+
+
+def previous_metadata(backup_json: Path, url: str) -> dict[str, object] | None:
+    state = load_backup_state(backup_json)
+    previous = backup_documents(state).get(url)
+    return previous if isinstance(previous, dict) else None
+
+
+def update_backup_state(path: Path, metadata: ExportMetadata) -> None:
+    state = load_backup_state(path)
+    state["version"] = 2
+    backup_documents(state)[metadata.url] = asdict(metadata)
+    state["last_sync_at"] = metadata.downloaded_at
     save_backup_state(path, state)
 
 
-def write_report(path: Path, metadata: ExportMetadata) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    status = "skipped" if metadata.skipped else "exported"
-    lines = [
-        "Personal Knowledge Hub backup report",
-        f"status: {status}",
-        f"time: {metadata.exported_at}",
-        f"url: {metadata.url}",
-        f"title: {metadata.title}",
-        f"selector: {metadata.selector}",
-        f"output: {metadata.output_path}",
-        f"characters: {metadata.character_count}",
-        f"content_hash: {metadata.content_hash}",
-    ]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def should_skip_export(backup_json: Path, url: str, digest: str, force: bool) -> bool:
+def should_skip_export(backup_json: Path, url: str, shimo_updated_at: str | None, force: bool) -> bool:
     if force or not backup_json.exists():
         return False
-    state = load_backup_state(backup_json)
-    documents = state.get("documents", {})
-    if not isinstance(documents, dict):
+    previous = previous_metadata(backup_json, url)
+    if previous is None:
         return False
-    previous = documents.get(url, {})
-    return isinstance(previous, dict) and previous.get("content_hash") == digest
+    local_path = previous.get("local_path")
+    if not isinstance(local_path, str) or not Path(local_path).exists():
+        return False
+    if shimo_updated_at and previous.get("shimo_updated_at") != shimo_updated_at:
+        return False
+    return True
+
+
+def parse_date_input(value: str) -> date:
+    value = value.strip()
+    match = TITLE_DATE_RE.fullmatch(value)
+    if match:
+        return date(2000 + int(match.group("yy")), int(match.group("m")), int(match.group("d")))
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def in_date_range(title: str, start: date | None, end: date | None) -> bool:
+    parsed = title_date(title)
+    if parsed is None:
+        return False
+    if start and parsed < start:
+        return False
+    if end and parsed > end:
+        return False
+    return True
 
 
 def save_timeout_debug(page: Page, debug_dir: Path) -> None:
@@ -144,199 +193,220 @@ def save_timeout_debug(page: Page, debug_dir: Path) -> None:
     html_path = debug_dir / "timeout.html"
     page.screenshot(path=str(screenshot_path), full_page=True)
     html_path.write_text(page.content(), encoding="utf-8")
+    print(f"[timeout] current url: {page.url}")
+    try:
+        print(f"[timeout] page title: {page.title()}")
+    except Exception as exc:
+        print(f"[timeout] page title unavailable: {exc}")
     print(f"[timeout] screenshot saved: {screenshot_path}")
     print(f"[timeout] html saved: {html_path}")
 
 
-def selector_has_visible_text(page: Page, selector: str, min_chars: int) -> bool:
+def first_visible(page: Page, selectors: Iterable[str], debug: bool, timeout_ms: int = 2500) -> Locator:
+    last_error: Exception | None = None
+    for selector in selectors:
+        debug_log(debug, f"waiting/click candidate: {selector}")
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            debug_log(debug, f"found selector: {selector}")
+            return locator
+        except Exception as exc:
+            last_error = exc
+            debug_log(debug, f"selector unavailable: {selector} ({exc})")
+    raise RuntimeError(f"No visible selector found. Last error: {last_error}")
+
+
+def read_shimo_updated_at(page: Page, debug: bool) -> str | None:
     try:
-        return bool(
-            page.locator(selector).evaluate_all(
-                """
-                (nodes, minChars) => nodes.some((node) => {
-                    const style = window.getComputedStyle(node);
-                    const rect = node.getBoundingClientRect();
-                    const text = (node.innerText || node.textContent || '').trim();
-                    return style.visibility !== 'hidden'
-                        && style.display !== 'none'
-                        && rect.width > 0
-                        && rect.height > 0
-                        && text.length >= minChars;
-                })
-                """,
-                min_chars,
-            )
-        )
-    except Exception:
-        return False
-
-
-def find_body_candidate(page: Page, debug: bool, min_chars: int) -> BodyCandidate | None:
-    for selector in BODY_SELECTORS:
-        debug_log(debug, f"checking selector: {selector}")
-        found = selector_has_visible_text(page, selector, min_chars)
-        debug_log(debug, f"selector={selector!r} found_visible_body={found}")
-        if not found:
-            continue
-        texts = page.locator(selector).evaluate_all(
-            """
-            (nodes) => nodes
-                .map((node) => (node.innerText || node.textContent || '').trim())
-                .filter(Boolean)
-                .sort((a, b) => b.length - a.length)
-            """
-        )
-        if texts:
-            return BodyCandidate(selector=selector, text=texts[0])
+        body_text = page.locator("body").inner_text(timeout=3000)
+    except Exception as exc:
+        debug_log(debug, f"cannot read body text for updated_at: {exc}")
+        return None
+    match = UPDATED_RE.search(body_text)
+    if match:
+        value = match.group("value").strip()[:80]
+        debug_log(debug, f"detected shimo_updated_at: {value}")
+        return value
     return None
 
 
-def wait_for_body(page: Page, debug: bool, timeout_ms: int, min_chars: int) -> BodyCandidate:
+def trigger_official_word_download(page: Page, debug: bool, timeout_ms: int) -> Download:
+    menu = first_visible(page, MENU_SELECTORS, debug)
+    menu.click()
+    download_item = first_visible(page, DOWNLOAD_SELECTORS, debug)
+    download_item.click()
+    word_item = first_visible(page, WORD_SELECTORS, debug)
+    with page.expect_download(timeout=timeout_ms) as download_info:
+        word_item.click()
+    return download_info.value
+
+
+def move_download(download: Download, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    suggested = safe_filename(download.suggested_filename or output_path.name)
+    if output_path.name == "":
+        output_path = output_path / suggested
+    download.save_as(str(output_path))
+    return output_path
+
+
+def write_report(path: Path, stats: SyncStats, export_dir: Path, last_sync: str, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = [
+        "Personal Knowledge Hub backup report",
+        f"新增：{stats.added}",
+        f"更新：{stats.updated}",
+        f"跳过：{stats.skipped}",
+        f"失败：{stats.failed}",
+        f"导出目录：{export_dir}",
+        f"最后同步：{last_sync}",
+        "",
+        "明细：",
+        *lines,
+    ]
+    path.write_text("\n".join(report) + "\n", encoding="utf-8")
+
+
+def export_one(page: Page, args: argparse.Namespace, url: str, stats: SyncStats, report_lines: list[str]) -> None:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-    debug_log(debug, f"current url: {page.url}")
-    debug_log(debug, f"page title: {page.title()}")
-
-    immediate_candidate = find_body_candidate(page, debug, min_chars)
-    if immediate_candidate:
-        debug_log(debug, f"DOM found body node: true, selector={immediate_candidate.selector}")
-        return immediate_candidate
-
     try:
-        debug_log(debug, "waiting load state: networkidle")
-        page.wait_for_load_state("networkidle", timeout=timeout_ms)
-    except PlaywrightTimeoutError:
-        # New Shimo pages may keep background connections open. If readable
-        # content is already visible, continue with DOM detection instead of
-        # failing on the load-state wait.
-        debug_log(debug, "networkidle timeout; continue checking visible body selectors")
-
-    debug_log(debug, f"current url: {page.url}")
-    debug_log(debug, f"page title: {page.title()}")
-
-    deadline_selector = BODY_SELECTORS[-1]
-    for selector in BODY_SELECTORS:
-        debug_log(debug, f"waiting selector: {selector}")
+        print(f"[sync] open: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=args.timeout)
         try:
-            page.wait_for_function(
-                """
-                ({ selector, minChars }) => Array.from(document.querySelectorAll(selector)).some((node) => {
-                    const style = window.getComputedStyle(node);
-                    const rect = node.getBoundingClientRect();
-                    const text = (node.innerText || node.textContent || '').trim();
-                    return style.visibility !== 'hidden'
-                        && style.display !== 'none'
-                        && rect.width > 0
-                        && rect.height > 0
-                        && text.length >= minChars;
-                })
-                """,
-                {"selector": selector, "minChars": min_chars},
-                timeout=3000 if selector != deadline_selector else 5000,
-            )
+            page.wait_for_load_state("networkidle", timeout=args.timeout)
         except PlaywrightTimeoutError:
-            debug_log(debug, f"selector timeout: {selector}")
-            continue
+            debug_log(args.debug, "networkidle timeout; continue official download flow")
 
-        candidate = find_body_candidate(page, debug, min_chars)
-        if candidate:
-            debug_log(debug, f"DOM found body node: true, selector={candidate.selector}")
-            return candidate
+        title = safe_filename(page.title() or "石墨文档")
+        shimo_updated_at = args.updated_at or read_shimo_updated_at(page, args.debug)
+        if args.start_date or args.end_date:
+            if not in_date_range(title, args.start_date, args.end_date):
+                stats.skipped += 1
+                report_lines.append(f"跳过（日期范围外）：{title} {url}")
+                return
 
-    candidate = find_body_candidate(page, debug, min_chars)
-    if candidate:
-        return candidate
-    raise ShimoPageTimeoutError(f"No readable Shimo body found within {timeout_ms}ms")
+        existed_before = previous_metadata(args.backup_json, url) is not None
+        if should_skip_export(args.backup_json, url, shimo_updated_at, args.force):
+            stats.skipped += 1
+            report_lines.append(f"跳过（未修改）：{title} {url}")
+            print(f"[skip] unchanged: {title}")
+            return
+
+        output_path = args.output or default_output_path(args.output_dir, title)
+        download = trigger_official_word_download(page, args.debug, args.timeout)
+        final_path = move_download(download, output_path)
+        digest = file_hash(final_path) if args.hash_file else None
+        metadata = ExportMetadata(
+            title=title,
+            url=url,
+            local_filename=final_path.name,
+            local_path=str(final_path),
+            downloaded_at=now_iso(),
+            shimo_updated_at=shimo_updated_at,
+            content_hash=digest,
+        )
+        update_backup_state(args.backup_json, metadata)
+        if existed_before:
+            stats.updated += 1
+            report_lines.append(f"更新：{title} -> {final_path}")
+        else:
+            stats.added += 1
+            report_lines.append(f"新增：{title} -> {final_path}")
+        print(f"[ok] official Word downloaded: {final_path}")
+    except Exception as exc:
+        stats.failed += 1
+        report_lines.append(f"失败：{url} {exc}")
+        print(f"[error] {url}: {exc}")
+        save_timeout_debug(page, args.debug_dir)
 
 
-def write_word(title: str, text: str, output_path: Path) -> None:
-    if Document is None:
-        raise RuntimeError("Missing dependency: install python-docx to write .docx files.")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    document = Document()
-    document.add_heading(title or "石墨导出", level=1)
-    for block in re.split(r"\n{2,}", text):
-        block = block.strip()
-        if block:
-            document.add_paragraph(block)
-    document.save(output_path)
+def urls_from_args(args: argparse.Namespace) -> list[str]:
+    urls = list(args.urls or [])
+    if args.url:
+        urls.append(args.url)
+    if args.url_file:
+        urls.extend(line.strip() for line in args.url_file.read_text(encoding="utf-8").splitlines() if line.strip())
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a Shimo document to Word.")
-    parser.add_argument("--url", required=True, help="Shimo document URL")
-    parser.add_argument("--output", type=Path, default=None, help="Output .docx path")
-    parser.add_argument("--backup-json", type=Path, default=Path("backup.json"), help="Incremental backup state file")
-    parser.add_argument("--report", type=Path, default=Path("backup-report.txt"), help="Human-readable backup report path")
+    parser = argparse.ArgumentParser(description="Sync Shimo documents through official Word downloads.")
+    parser.add_argument("--url", help="Single Shimo document URL")
+    parser.add_argument("--urls", nargs="*", help="One or more Shimo document URLs")
+    parser.add_argument("--url-file", type=Path, help="Text file containing one Shimo URL per line")
+    parser.add_argument("--output", type=Path, default=None, help="Single-document output .docx path")
+    parser.add_argument("--output-dir", type=Path, default=Path("exports"), help="Base export directory")
+    parser.add_argument("--backup-json", type=Path, default=Path("backup.json"), help="Sync database path")
+    parser.add_argument("--report", type=Path, default=Path("backup-report.txt"), help="Human-readable sync report path")
     parser.add_argument("--profile-dir", type=Path, default=Path(".shimo-browser-profile"), help="Persistent browser profile for Shimo login state")
+    parser.add_argument("--mode", choices=["all", "new", "7days", "30days", "range", "single", "force"], default="new")
+    parser.add_argument("--start", help="Start date for range mode, e.g. 26.7.01 or 2026-07-01")
+    parser.add_argument("--end", help="End date for range mode, e.g. 26.7.15 or 2026-07-15")
+    parser.add_argument("--updated-at", help="Known Shimo last modified time for a single document")
+    parser.add_argument("--hash-file", action="store_true", help="Hash downloaded .docx file and store it in backup.json")
     parser.add_argument("--force", action="store_true", help="Export even when backup.json says content is unchanged")
     parser.add_argument("--debug", action="store_true", help="Print selector, URL, title, and DOM diagnostics")
     parser.add_argument("--debug-dir", type=Path, default=Path("debug"), help="Directory for timeout.png and timeout.html")
-    parser.add_argument("--timeout", type=int, default=45000, help="Overall page/body wait timeout in milliseconds")
-    parser.add_argument("--min-chars", type=int, default=20, help="Minimum visible text length considered as document body")
+    parser.add_argument("--timeout", type=int, default=45000, help="Page/download timeout in milliseconds")
     parser.add_argument("--headed", action="store_true", help="Run Chromium with a visible window")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.start_date = parse_date_input(args.start) if args.start else None
+    args.end_date = parse_date_input(args.end) if args.end else None
+    if args.mode == "7days":
+        args.start_date = datetime.now().date() - timedelta(days=7)
+    elif args.mode == "30days":
+        args.start_date = datetime.now().date() - timedelta(days=30)
+    elif args.mode in {"all", "force"}:
+        args.force = True
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    urls = urls_from_args(args)
+    if not urls:
+        print("[error] No Shimo URL provided. Use --url, --urls, or --url-file.")
+        return 1
     try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+        from playwright.sync_api import sync_playwright
     except ImportError as exc:
         print("[error] Missing dependency: install playwright and run `playwright install chromium`.")
         print(f"[error] {exc}")
         return 1
 
+    stats = SyncStats()
+    report_lines: list[str] = []
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(args.profile_dir),
             headless=not args.headed,
+            accept_downloads=True,
         )
         page = context.new_page()
         try:
-            page.goto(args.url, wait_until="domcontentloaded", timeout=args.timeout)
-            candidate = wait_for_body(page, args.debug, args.timeout, args.min_chars)
-            title = page.title() or "石墨导出"
-            digest = content_hash(candidate.text)
-            output_path = args.output or Path("exports") / f"{safe_filename(title)}.docx"
-
-            skipped = should_skip_export(args.backup_json, args.url, digest, args.force)
-            if skipped:
-                print("[ok] unchanged; export skipped")
-            else:
-                write_word(title, candidate.text, output_path)
-                print(f"[ok] exported selector: {candidate.selector}")
-                print(f"[ok] output: {output_path}")
-
-            metadata = ExportMetadata(
-                url=args.url,
-                title=title,
-                selector=candidate.selector,
-                output_path=str(output_path),
-                content_hash=digest,
-                exported_at=now_iso(),
-                character_count=len(candidate.text),
-                skipped=skipped,
-            )
-            update_backup_state(args.backup_json, metadata)
-            write_report(args.report, metadata)
-            print(f"[ok] backup state: {args.backup_json}")
-            print(f"[ok] report: {args.report}")
-            return 0
-        except (PlaywrightTimeoutError, ShimoPageTimeoutError) as exc:
-            print(f"[timeout] {exc}")
-            print(f"[timeout] current url: {page.url}")
-            try:
-                print(f"[timeout] page title: {page.title()}")
-            except Exception as title_error:
-                print(f"[timeout] page title unavailable: {title_error}")
-            save_timeout_debug(page, args.debug_dir)
-            if args.debug:
-                candidate = find_body_candidate(page, True, args.min_chars)
-                print(f"[debug] DOM found body node: {candidate is not None}")
-            return 2
+            for url in urls:
+                export_one(page, args, url, stats, report_lines)
         finally:
             context.close()
+
+    last_sync = datetime.now().strftime("%Y-%m-%d %H:%M")
+    write_report(args.report, stats, args.output_dir, last_sync, report_lines)
+    print("[summary]")
+    print(f"新增：{stats.added}")
+    print(f"更新：{stats.updated}")
+    print(f"跳过：{stats.skipped}")
+    print(f"失败：{stats.failed}")
+    print(f"导出目录：{args.output_dir}")
+    print(f"最后同步：{last_sync}")
+    return 0 if stats.failed == 0 else 2
 
 
 if __name__ == "__main__":

@@ -10,9 +10,14 @@ preserve = [".shimo-browser-profile", "config.toml", "backup.json", "backup-repo
 [platforms.shimo]
 enabled = true
 profile_dir = ".shimo-browser-profile"
+url_file = "shimo_urls.txt"
 urls = [
   "https://shimo.im/docs/K0GYR3gFakvm4ZLG/"
 ]
+
+[sync]
+default_mode = "new"
+available_modes = ["all", "new", "7days", "30days", "range", "single", "force"]
 
 [platforms.notion]
 enabled = false
